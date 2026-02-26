@@ -1,0 +1,81 @@
+import type { PromptConfig } from "../types";
+
+export const DEFAULT_PROMPT_CONFIG: PromptConfig = {
+  textFilterSystem: [
+    "You filter PDF text for qualitative coding.",
+    "Keep only core narrative paragraphs with full sentence content.",
+    "Exclude short fragments, standalone headings, labels, menu items, callouts, captions, and bullet stubs unless they form full sentence paragraphs.",
+    "Remove boilerplate: headers, footers, page numbers, cookie/privacy/subscription notices, navigation, ads/promos, contact/social blocks, repeated templates, and non-core table-of-contents text.",
+    "Preserve original wording and reading order. Do not paraphrase.",
+    "Only keep paragraphs that are useful as qualitative coding units (generally sentence-based, not title fragments).",
+    "If uncertain, prefer exclusion or include with possible_boilerplate=true and note.",
+    "Respond with strict JSON object:",
+    '{"keep":[{"id":"string","possible_boilerplate":false,"section_heading":"optional","note":"optional","confidence":0.0}],"warnings":["optional warning"]}',
+  ].join("\n"),
+  visionSystem: [
+    "You are performing OCR and main-content extraction from a PDF page image.",
+    "Extract readable paragraph text exactly as written. Do not paraphrase.",
+    "Keep only main subject-matter content with full sentence paragraphs suitable for qualitative coding.",
+    "Exclude short fragments and standalone headings/titles unless they are part of a full sentence paragraph.",
+    "Remove extraneous content including headers, footers, page numbers, navigation, ads/promotions, cookie/privacy/subscription banners, repeated disclaimers not central to content, contact/social blocks, repeated template text, and non-core table-of-contents entries.",
+    "Preserve reading order and coherent paragraph boundaries.",
+    "If uncertain about boilerplate, exclude it or keep it with possible_boilerplate=true and note.",
+    "Respond with strict JSON only:",
+    '{"paragraphs":[{"text":"string","section_heading":"optional","note":"optional","possible_boilerplate":false,"confidence":0.0}],"warnings":["optional warning"]}',
+  ].join("\n"),
+};
+
+function sectionContent(markdown: string, section: string): string | null {
+  const headingRegex = new RegExp(`^##\\s+${section}\\s*$`, "im");
+  const headingMatch = headingRegex.exec(markdown);
+  if (!headingMatch || headingMatch.index < 0) {
+    return null;
+  }
+
+  const start = headingMatch.index + headingMatch[0].length;
+  const remainder = markdown.slice(start);
+  const nextHeading = /^\s*##\s+/m.exec(remainder);
+  const rawSection = nextHeading
+    ? remainder.slice(0, nextHeading.index)
+    : remainder;
+
+  const fenced = /```(?:text|md|markdown)?\s*([\s\S]*?)```/i.exec(rawSection);
+  const content = fenced?.[1] ?? rawSection;
+  const normalized = content.trim();
+  return normalized || null;
+}
+
+export function parsePromptConfigMarkdown(markdown: string): PromptConfig {
+  const textFilterSystem = sectionContent(markdown, "text_filter_system");
+  const visionSystem = sectionContent(markdown, "vision_page_system");
+
+  if (!textFilterSystem || !visionSystem) {
+    throw new Error(
+      "Prompt markdown is invalid. Required sections: ## text_filter_system and ## vision_page_system.",
+    );
+  }
+
+  return {
+    textFilterSystem,
+    visionSystem,
+  };
+}
+
+export function promptConfigToMarkdown(config: PromptConfig): string {
+  return [
+    "# PDF2CSV Prompt Configuration",
+    "",
+    "Edit the two sections below. Keep both section headers unchanged.",
+    "",
+    "## text_filter_system",
+    "```text",
+    config.textFilterSystem.trim(),
+    "```",
+    "",
+    "## vision_page_system",
+    "```text",
+    config.visionSystem.trim(),
+    "```",
+    "",
+  ].join("\n");
+}
