@@ -9,6 +9,10 @@ Browser-based app for extracting **main-body paragraphs** from one or more PDFs 
   - OpenAI-compatible endpoints
   - Ollama-compatible endpoints
 - Model listing from endpoint, with manual model ID fallback if listing fails
+- OpenAI batch mode:
+  - Build one JSONL batch input from all extraction requests
+  - Submit via the OpenAI Files + Batches API
+  - Refresh remote status and import completed results later
 - Ollama advanced generation controls:
   - `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `num_ctx`
   - Optional native tool calling for structured extraction outputs
@@ -70,9 +74,19 @@ npm run preview
 1. Set `Backend type` to `OpenAI-compatible`
 2. Base URL auto-defaults to `https://api.openai.com/v1/` (switching back to OpenAI resets to this default)
 3. Enter API key
-4. Click `Load Models`
-5. Select a model from dropdown, or fill `Manual model ID`
-6. For scanned/image-only PDFs, choose a vision-capable model.
+4. Choose `OpenAI request mode`:
+   - `Live requests` for immediate extraction
+   - `Batch mode` to submit all requests asynchronously for later import
+5. Click `Load Models`
+6. Select a model from dropdown, or fill `Manual model ID`
+7. For scanned/image-only PDFs, choose a vision-capable model.
+
+When `OpenAI request mode` is `Batch mode`:
+
+- `Submit Batch` prepares all chunk/page requests locally, uploads one JSONL batch input file, and creates an OpenAI batch job.
+- Use `Refresh Status` to poll the remote batch.
+- Use `Import Results` after the batch reaches a terminal state (`completed`, `expired`, `cancelled`, or `failed` with error file output).
+- Batch jobs are tracked in browser session storage for the current tab session.
 
 When using the official OpenAI endpoint (`https://api.openai.com/v1`) in local development:
 

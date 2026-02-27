@@ -1,6 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { listModels } from "./lib/backend";
-import { runExtraction } from "./lib/extractor";
+import {
+  cancelOpenAiBatch,
+  createOpenAiBatch,
+  downloadOpenAiFileContent,
+  listModels,
+  retrieveOpenAiBatch,
+  uploadOpenAiBatchInputFile,
+  type OpenAiBatchObject,
+} from "./lib/backend";
+import {
+  importOpenAiBatchResultFiles,
+  prepareOpenAiExtractionBatch,
+  runExtraction,
+  type OpenAiExtractionBatchManifest,
+} from "./lib/extractor";
 import { downloadCsv, downloadXlsx } from "./lib/exporters";
 import {
   DEFAULT_PROMPT_CONFIG,
@@ -24,12 +37,20 @@ import type {
   RunProgress,
 } from "./types";
 
+interface BackendModelState {
+  models: string[];
+  selectedModel: string;
+  manualModel: string;
+}
+
 interface SavedSettings {
   rememberSettings: boolean;
   backendKind: BackendKind;
   baseUrl: string;
-  selectedModel: string;
-  manualModel: string;
+  backendModels?: Record<BackendKind, BackendModelState>;
+  openAiExecutionMode?: OpenAiExecutionMode;
+  selectedModel?: string;
+  manualModel?: string;
   concurrency: number;
   retries: number;
   promptConfig: PromptConfig;
@@ -37,7 +58,31 @@ interface SavedSettings {
   ollamaSettings: OllamaGenerationSettings;
 }
 
+type OpenAiExecutionMode = "live" | "batch";
+
+type BatchActionState = "" | "refresh" | "import" | "cancel";
+
+interface PersistedOpenAiBatchJob {
+  batchId: string;
+  baseUrl: string;
+  status: string;
+  inputFileId: string;
+  outputFileId: string | null;
+  errorFileId: string | null;
+  requestCounts?: {
+    total: number;
+    completed: number;
+    failed: number;
+  };
+  manifest: OpenAiExtractionBatchManifest;
+  requestCount: number;
+  requestBytes: number;
+  createdAt: string;
+  lastCheckedAt: string;
+}
+
 const SETTINGS_KEY = "pdf2csv.settings.v1";
+const BATCH_SESSION_KEY = "pdf2csv.openai-batch.v1";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1/";
 const DEFAULT_OLLAMA_BASE_URL = "http://192.168.4.35:11434";
 
@@ -95,6 +140,122 @@ function toNumber(value: string, fallback: number): number {
   return parsed;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isTerminalBatchStatus(status: string): boolean {
+  return ["completed", "failed", "expired", "cancelled"].includes(status);
+}
+
+function restoreBatchJob(raw: string | null): PersistedOpenAiBatchJob | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedOpenAiBatchJob;
+    if (
+      !parsed.batchId ||
+      !parsed.status ||
+      !parsed.manifest ||
+      !Array.isArray(parsed.manifest.tasks) ||
+      !Array.isArray(parsed.manifest.files)
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function toPersistedBatchJob(
+  batch: OpenAiBatchObject,
+  manifest: OpenAiExtractionBatchManifest,
+  requestCount: number,
+  requestBytes: number,
+  baseUrl: string,
+): PersistedOpenAiBatchJob {
+  const now = new Date().toISOString();
+  return {
+    batchId: batch.id,
+    baseUrl,
+    status: batch.status,
+    inputFileId: batch.input_file_id,
+    outputFileId: batch.output_file_id ?? null,
+    errorFileId: batch.error_file_id ?? null,
+    requestCounts: batch.request_counts,
+    manifest,
+    requestCount,
+    requestBytes,
+    createdAt: batch.created_at
+      ? new Date(batch.created_at * 1000).toISOString()
+      : now,
+    lastCheckedAt: now,
+  };
+}
+
+function mergeBatchJobUpdate(
+  previous: PersistedOpenAiBatchJob,
+  batch: OpenAiBatchObject,
+): PersistedOpenAiBatchJob {
+  return {
+    ...previous,
+    status: batch.status,
+    inputFileId: batch.input_file_id,
+    outputFileId: batch.output_file_id ?? null,
+    errorFileId: batch.error_file_id ?? null,
+    requestCounts: batch.request_counts,
+    lastCheckedAt: new Date().toISOString(),
+  };
+}
+
+function createDefaultBackendModels(): Record<BackendKind, BackendModelState> {
+  return {
+    openai: {
+      models: [],
+      selectedModel: "",
+      manualModel: "",
+    },
+    ollama: {
+      models: [],
+      selectedModel: "",
+      manualModel: "",
+    },
+  };
+}
+
+function sanitizeBackendModelState(
+  state: Partial<BackendModelState> | undefined,
+): BackendModelState {
+  return {
+    models: Array.isArray(state?.models)
+      ? state.models.filter((model): model is string => typeof model === "string")
+      : [],
+    selectedModel:
+      typeof state?.selectedModel === "string" ? state.selectedModel : "",
+    manualModel: typeof state?.manualModel === "string" ? state.manualModel : "",
+  };
+}
+
+function loadSavedBackendModels(
+  parsed: SavedSettings,
+): Record<BackendKind, BackendModelState> {
+  if (parsed.backendModels) {
+    return {
+      openai: sanitizeBackendModelState(parsed.backendModels.openai),
+      ollama: sanitizeBackendModelState(parsed.backendModels.ollama),
+    };
+  }
+
+  const fallback = createDefaultBackendModels();
+  fallback[parsed.backendKind] = sanitizeBackendModelState({
+    selectedModel: parsed.selectedModel,
+    manualModel: parsed.manualModel,
+  });
+  return fallback;
+}
+
 export default function App(): JSX.Element {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const promptFileInputRef = useRef<HTMLInputElement>(null);
@@ -105,9 +266,12 @@ export default function App(): JSX.Element {
     defaultBaseUrlForBackend("openai"),
   );
   const [apiKey, setApiKey] = useState("");
-  const [models, setModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState("");
-  const [manualModel, setManualModel] = useState("");
+  const [openAiExecutionMode, setOpenAiExecutionMode] =
+    useState<OpenAiExecutionMode>("live");
+  const [backendModels, setBackendModels] = useState<Record<
+    BackendKind,
+    BackendModelState
+  >>(createDefaultBackendModels);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelError, setModelError] = useState("");
 
@@ -129,7 +293,16 @@ export default function App(): JSX.Element {
   const [rows, setRows] = useState<ExtractionRow[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [progress, setProgress] = useState<RunProgress | null>(null);
+  const [batchJob, setBatchJob] = useState<PersistedOpenAiBatchJob | null>(null);
+  const [batchAction, setBatchAction] = useState<BatchActionState>("");
 
+  const currentBackendModels = backendModels[backendKind];
+  const models = currentBackendModels.models;
+  const selectedModel = currentBackendModels.selectedModel;
+  const manualModel = currentBackendModels.manualModel;
+  const isBatchMode =
+    backendKind === "openai" && openAiExecutionMode === "batch";
+  const isBatchActionRunning = batchAction !== "";
   const activeModel = useMemo(
     () => manualModel.trim() || selectedModel.trim(),
     [manualModel, selectedModel],
@@ -144,8 +317,8 @@ export default function App(): JSX.Element {
       setRememberSettings(true);
       setBackendKind(parsed.backendKind);
       setBaseUrl(parsed.baseUrl);
-      setSelectedModel(parsed.selectedModel);
-      setManualModel(parsed.manualModel);
+      setOpenAiExecutionMode(parsed.openAiExecutionMode ?? "live");
+      setBackendModels(loadSavedBackendModels(parsed));
       setConcurrency(parsed.concurrency);
       setRetries(parsed.retries);
       setQualitySettings(sanitizeQualitySettings(parsed.qualitySettings));
@@ -162,6 +335,14 @@ export default function App(): JSX.Element {
   }, []);
 
   useEffect(() => {
+    try {
+      setBatchJob(restoreBatchJob(sessionStorage.getItem(BATCH_SESSION_KEY)));
+    } catch {
+      setBatchJob(null);
+    }
+  }, []);
+
+  useEffect(() => {
     if (!rememberSettings) {
       localStorage.removeItem(SETTINGS_KEY);
       return;
@@ -171,8 +352,8 @@ export default function App(): JSX.Element {
       rememberSettings,
       backendKind,
       baseUrl,
-      selectedModel,
-      manualModel,
+      backendModels,
+      openAiExecutionMode,
       concurrency,
       retries,
       promptConfig,
@@ -184,8 +365,8 @@ export default function App(): JSX.Element {
     rememberSettings,
     backendKind,
     baseUrl,
-    selectedModel,
-    manualModel,
+    backendModels,
+    openAiExecutionMode,
     concurrency,
     retries,
     promptConfig,
@@ -193,8 +374,30 @@ export default function App(): JSX.Element {
     ollamaSettings,
   ]);
 
+  useEffect(() => {
+    try {
+      if (!batchJob) {
+        sessionStorage.removeItem(BATCH_SESSION_KEY);
+        return;
+      }
+      sessionStorage.setItem(BATCH_SESSION_KEY, JSON.stringify(batchJob));
+    } catch {
+      // Ignore session storage quota or serialization failures.
+    }
+  }, [batchJob]);
+
   function appendLog(level: LogLevel, message: string): void {
     setLogs((previous) => [...previous, createLog(level, message)]);
+  }
+
+  function updateBackendModels(
+    kind: BackendKind,
+    updater: (current: BackendModelState) => BackendModelState,
+  ): void {
+    setBackendModels((previous) => ({
+      ...previous,
+      [kind]: updater(previous[kind]),
+    }));
   }
 
   function onChooseFiles(filesLike: FileList | null): void {
@@ -223,29 +426,267 @@ export default function App(): JSX.Element {
   }
 
   async function handleLoadModels(): Promise<void> {
+    const kind = backendKind;
     setModelError("");
     setModelLoading(true);
     try {
       const loaded = await listModels({
-        kind: backendKind,
+        kind,
         baseUrl,
         apiKey,
       });
-      setModels(loaded);
-      if (!selectedModel || !loaded.includes(selectedModel)) {
-        setSelectedModel(loaded[0]);
-      }
+      updateBackendModels(kind, (current) => ({
+        ...current,
+        models: loaded,
+        selectedModel:
+          current.selectedModel && loaded.includes(current.selectedModel)
+            ? current.selectedModel
+            : (loaded[0] ?? ""),
+      }));
       appendLog("info", `Loaded ${loaded.length} model(s) from endpoint.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       setModelError(message);
-      setModels([]);
+      updateBackendModels(kind, (current) => ({
+        ...current,
+        models: [],
+      }));
       appendLog(
         "warning",
         `Model listing failed. You can still enter a manual model ID. ${message}`,
       );
     } finally {
       setModelLoading(false);
+    }
+  }
+
+  function warnAboutOpenAiBrowserProxyIfNeeded(): void {
+    if (
+      backendKind !== "openai" ||
+      !/^https:\/\/api\.openai\.com(?:\/v1)?\/?$/i.test(baseUrl.trim())
+    ) {
+      return;
+    }
+
+    const host = window.location.hostname;
+    const isLocalDevHost = host === "localhost" || host === "127.0.0.1";
+    if (!isLocalDevHost) {
+      appendLog(
+        "warning",
+        "Official OpenAI endpoint from a browser may require a relay/proxy. In local development, run via `npm run dev` to use built-in proxy routing.",
+      );
+    }
+  }
+
+  function clearBatchJob(): void {
+    setBatchJob(null);
+  }
+
+  async function handleSubmitBatch(): Promise<void> {
+    setRows([]);
+    setLogs([]);
+    setProgress({
+      totalPdfs: files.length,
+      completedPdfs: 0,
+      currentPdf: "",
+      currentPage: 0,
+      totalPagesForCurrent: 0,
+    });
+    setIsRunning(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    warnAboutOpenAiBrowserProxyIfNeeded();
+
+    try {
+      const prepared = await prepareOpenAiExtractionBatch(files, {
+        config: {
+          kind: "openai",
+          baseUrl: baseUrl.trim(),
+          apiKey,
+          model: activeModel,
+        },
+        prompts: promptConfig,
+        quality: qualitySettings,
+        fileConcurrency: concurrency,
+        retries,
+        signal: controller.signal,
+        onLog: appendLog,
+        onProgress: setProgress,
+      });
+
+      appendLog(
+        "info",
+        `Prepared ${prepared.requestCount} batch request(s) in ${formatBytes(prepared.requestBytes)}.`,
+      );
+
+      const uploaded = await uploadOpenAiBatchInputFile(
+        {
+          baseUrl: baseUrl.trim(),
+          apiKey,
+        },
+        prepared.inputFile,
+        `pdf2csv-batch-${Date.now()}.jsonl`,
+        controller.signal,
+      );
+      appendLog("info", `Uploaded batch input file ${uploaded.id}.`);
+
+      const batch = await createOpenAiBatch(
+        {
+          baseUrl: baseUrl.trim(),
+          apiKey,
+        },
+        uploaded.id,
+        controller.signal,
+        {
+          app: "pdf2csv",
+          model: activeModel,
+        },
+      );
+
+      setBatchJob(
+        toPersistedBatchJob(
+          batch,
+          prepared.manifest,
+          prepared.requestCount,
+          prepared.requestBytes,
+          baseUrl.trim(),
+        ),
+      );
+      setProgress(null);
+      appendLog(
+        "info",
+        `Submitted OpenAI batch ${batch.id}. Refresh status later, then import the results file when processing finishes.`,
+      );
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        appendLog("warning", "Batch submission canceled by user.");
+      } else {
+        const message =
+          error instanceof Error ? error.message : "Unknown batch submission error";
+        appendLog("error", `Batch submission failed: ${message}`);
+      }
+    } finally {
+      setIsRunning(false);
+      abortRef.current = null;
+    }
+  }
+
+  async function handleBatchRefresh(): Promise<void> {
+    if (!batchJob) return;
+    setBatchAction("refresh");
+    try {
+      const batch = await retrieveOpenAiBatch(
+        {
+          baseUrl: batchJob.baseUrl,
+          apiKey,
+        },
+        batchJob.batchId,
+      );
+      const nextJob = mergeBatchJobUpdate(batchJob, batch);
+      setBatchJob(nextJob);
+      appendLog(
+        "info",
+        `Batch ${nextJob.batchId} status: ${nextJob.status}.`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown batch refresh error";
+      appendLog("error", `Failed to refresh batch status: ${message}`);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function handleBatchImport(): Promise<void> {
+    if (!batchJob) return;
+    setBatchAction("import");
+    setLogs([]);
+    try {
+      const batch = await retrieveOpenAiBatch(
+        {
+          baseUrl: batchJob.baseUrl,
+          apiKey,
+        },
+        batchJob.batchId,
+      );
+      const nextJob = mergeBatchJobUpdate(batchJob, batch);
+      setBatchJob(nextJob);
+
+      if (!isTerminalBatchStatus(nextJob.status) && !nextJob.outputFileId) {
+        throw new Error(
+          `Batch is still ${nextJob.status}. Wait for completion, expiry, or cancellation before importing results.`,
+        );
+      }
+
+      if (!nextJob.outputFileId && !nextJob.errorFileId) {
+        throw new Error("Batch has no output or error file available to import.");
+      }
+
+      const [outputText, errorText] = await Promise.all([
+        nextJob.outputFileId
+          ? downloadOpenAiFileContent(
+              {
+                baseUrl: batchJob.baseUrl,
+                apiKey,
+              },
+              nextJob.outputFileId,
+            )
+          : Promise.resolve(null),
+        nextJob.errorFileId
+          ? downloadOpenAiFileContent(
+              {
+                baseUrl: batchJob.baseUrl,
+                apiKey,
+              },
+              nextJob.errorFileId,
+            )
+          : Promise.resolve(null),
+      ]);
+
+      const extractionRows = importOpenAiBatchResultFiles(
+        nextJob.manifest,
+        outputText,
+        errorText,
+        { onLog: appendLog },
+      );
+      setRows(extractionRows);
+      appendLog(
+        "info",
+        `Imported batch results. Final dataset contains ${extractionRows.length} row(s).`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown batch import error";
+      appendLog("error", `Batch import failed: ${message}`);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function handleBatchCancel(): Promise<void> {
+    if (!batchJob) return;
+    setBatchAction("cancel");
+    try {
+      const batch = await cancelOpenAiBatch(
+        {
+          baseUrl: batchJob.baseUrl,
+          apiKey,
+        },
+        batchJob.batchId,
+      );
+      const nextJob = mergeBatchJobUpdate(batchJob, batch);
+      setBatchJob(nextJob);
+      appendLog(
+        "warning",
+        `Cancellation requested for batch ${nextJob.batchId}. Current status: ${nextJob.status}.`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown batch cancel error";
+      appendLog("error", `Failed to cancel batch: ${message}`);
+    } finally {
+      setBatchAction("");
     }
   }
 
@@ -266,6 +707,11 @@ export default function App(): JSX.Element {
       return;
     }
 
+    if (isBatchMode) {
+      await handleSubmitBatch();
+      return;
+    }
+
     setRows([]);
     setLogs([]);
     setProgress({
@@ -278,20 +724,7 @@ export default function App(): JSX.Element {
     setIsRunning(true);
     const controller = new AbortController();
     abortRef.current = controller;
-
-    if (
-      backendKind === "openai" &&
-      /^https:\/\/api\.openai\.com(?:\/v1)?\/?$/i.test(baseUrl.trim())
-    ) {
-      const host = window.location.hostname;
-      const isLocalDevHost = host === "localhost" || host === "127.0.0.1";
-      if (!isLocalDevHost) {
-        appendLog(
-          "warning",
-          "Official OpenAI endpoint from a browser may require a relay/proxy. In local development, run via `npm run dev` to use built-in proxy routing.",
-        );
-      }
-    }
+    warnAboutOpenAiBrowserProxyIfNeeded();
 
     try {
       const extractionRows = await runExtraction(files, {
@@ -383,8 +816,6 @@ export default function App(): JSX.Element {
                 setBackendKind(nextKind);
                 setBaseUrl(defaultBaseUrlForBackend(nextKind));
                 setModelError("");
-                setModels([]);
-                setSelectedModel("");
               }}
               disabled={isRunning}
             >
@@ -418,6 +849,24 @@ export default function App(): JSX.Element {
             />
           </label>
 
+          {backendKind === "openai" && (
+            <label className="field">
+              <span>OpenAI request mode</span>
+              <select
+                value={openAiExecutionMode}
+                onChange={(event) =>
+                  setOpenAiExecutionMode(
+                    event.target.value as OpenAiExecutionMode,
+                  )
+                }
+                disabled={isRunning || isBatchActionRunning}
+              >
+                <option value="live">Live requests</option>
+                <option value="batch">Batch mode</option>
+              </select>
+            </label>
+          )}
+
           <div className="inline-actions">
             <button
               type="button"
@@ -432,7 +881,12 @@ export default function App(): JSX.Element {
             <span>Endpoint model list</span>
             <select
               value={selectedModel}
-              onChange={(event) => setSelectedModel(event.target.value)}
+              onChange={(event) =>
+                updateBackendModels(backendKind, (current) => ({
+                  ...current,
+                  selectedModel: event.target.value,
+                }))
+              }
               disabled={isRunning || models.length === 0}
             >
               <option value="">
@@ -450,7 +904,12 @@ export default function App(): JSX.Element {
             <span>Manual model ID (overrides dropdown when filled)</span>
             <input
               value={manualModel}
-              onChange={(event) => setManualModel(event.target.value)}
+              onChange={(event) =>
+                updateBackendModels(backendKind, (current) => ({
+                  ...current,
+                  manualModel: event.target.value,
+                }))
+              }
               placeholder="e.g. gpt-4o-mini or llama3.1:8b"
               disabled={isRunning}
             />
@@ -632,7 +1091,9 @@ export default function App(): JSX.Element {
               />
             </label>
             <label className="field">
-              <span>Retries per LLM chunk</span>
+              <span>
+                {isBatchMode ? "Retries per LLM chunk (live only)" : "Retries per LLM chunk"}
+              </span>
               <input
                 type="number"
                 min={0}
@@ -641,10 +1102,18 @@ export default function App(): JSX.Element {
                 onChange={(event) =>
                   setRetries(Math.max(0, Number(event.target.value) || 0))
                 }
-                disabled={isRunning}
+                disabled={isRunning || isBatchMode}
               />
             </label>
           </div>
+
+          {isBatchMode && (
+            <p className="muted">
+              Batch mode submits a JSONL file to the OpenAI Files + Batches API,
+              then lets you refresh status and import results later. It does not
+              issue live chat completions.
+            </p>
+          )}
 
           <label className="checkbox">
             <input
@@ -720,14 +1189,88 @@ export default function App(): JSX.Element {
               type="button"
               className="primary"
               onClick={handleRun}
-              disabled={isRunning || files.length === 0 || !baseUrl.trim()}
+              disabled={
+                isRunning ||
+                isBatchActionRunning ||
+                files.length === 0 ||
+                !baseUrl.trim()
+              }
             >
-              Run Extraction
+              {isBatchMode ? "Submit Batch" : "Run Extraction"}
             </button>
             <button type="button" onClick={handleCancel} disabled={!isRunning}>
               Cancel
             </button>
           </div>
+
+          {isBatchMode && (
+            <div className="subpanel">
+              <h3>OpenAI Batch Job</h3>
+              {!batchJob && (
+                <p className="muted">
+                  No batch submitted in this tab session yet.
+                </p>
+              )}
+              {batchJob && (
+                <>
+                  <p className="muted">
+                    Batch ID: <code>{batchJob.batchId}</code>
+                  </p>
+                  <p className="muted">
+                    Status: <strong>{batchJob.status}</strong>
+                  </p>
+                  <p className="muted">
+                    Requests:{" "}
+                    {batchJob.requestCounts
+                      ? `${batchJob.requestCounts.completed}/${batchJob.requestCounts.total} complete, ${batchJob.requestCounts.failed} failed`
+                      : `${batchJob.requestCount} submitted`}
+                  </p>
+                  <p className="muted">
+                    Input size: {formatBytes(batchJob.requestBytes)}
+                  </p>
+                  <div className="inline-actions">
+                    <button
+                      type="button"
+                      onClick={handleBatchRefresh}
+                      disabled={isRunning || isBatchActionRunning}
+                    >
+                      {batchAction === "refresh" ? "Refreshing..." : "Refresh Status"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleBatchImport}
+                      disabled={
+                        isRunning ||
+                        isBatchActionRunning ||
+                        (!isTerminalBatchStatus(batchJob.status) &&
+                          !batchJob.outputFileId)
+                      }
+                    >
+                      {batchAction === "import" ? "Importing..." : "Import Results"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleBatchCancel}
+                      disabled={
+                        isRunning ||
+                        isBatchActionRunning ||
+                        isTerminalBatchStatus(batchJob.status)
+                      }
+                    >
+                      {batchAction === "cancel" ? "Canceling..." : "Cancel Remote Batch"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearBatchJob}
+                      disabled={isRunning || isBatchActionRunning}
+                    >
+                      Clear Batch
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           <div className="progress-panel">
             <p>

@@ -20,6 +20,61 @@ export interface ChatCompletionRequestOptions {
   tool?: NativeToolDefinition;
 }
 
+export interface OpenAiTransportConfig {
+  baseUrl: string;
+  apiKey: string;
+}
+
+export interface OpenAiFileObject {
+  id: string;
+  object: string;
+  bytes?: number;
+  created_at?: number;
+  expires_at?: number | null;
+  filename?: string;
+  purpose?: string;
+}
+
+export interface OpenAiBatchObject {
+  id: string;
+  object: string;
+  endpoint: string;
+  input_file_id: string;
+  completion_window: string;
+  status: string;
+  output_file_id: string | null;
+  error_file_id: string | null;
+  created_at: number;
+  in_progress_at?: number | null;
+  expires_at?: number | null;
+  finalizing_at?: number | null;
+  completed_at?: number | null;
+  failed_at?: number | null;
+  expired_at?: number | null;
+  cancelling_at?: number | null;
+  cancelled_at?: number | null;
+  request_counts?: {
+    total: number;
+    completed: number;
+    failed: number;
+  };
+  errors?: {
+    data?: Array<{
+      code?: string;
+      line?: number;
+      message?: string;
+      param?: string;
+    }>;
+  } | null;
+  metadata?: Record<string, string> | null;
+}
+
+export interface OpenAiChatCompletionBody {
+  model: string;
+  messages: ChatMessage[];
+  response_format?: { type: "json_object" };
+}
+
 export class HttpError extends Error {
   status: number;
 
@@ -129,6 +184,24 @@ async function fetchJsonWithPathFallback(
   paths: string[],
   init: RequestInit,
 ): Promise<unknown> {
+  const response = await fetchWithPathFallback(baseUrl, paths, init);
+  return await response.json();
+}
+
+async function fetchTextWithPathFallback(
+  baseUrl: string,
+  paths: string[],
+  init: RequestInit,
+): Promise<string> {
+  const response = await fetchWithPathFallback(baseUrl, paths, init);
+  return await response.text();
+}
+
+async function fetchWithPathFallback(
+  baseUrl: string,
+  paths: string[],
+  init: RequestInit,
+): Promise<Response> {
   const resolvedBaseUrl = toDevProxyBaseUrlIfNeeded(baseUrl);
   let lastError: Error | null = null;
 
@@ -138,7 +211,7 @@ async function fetchJsonWithPathFallback(
       const response = await fetch(url, init);
 
       if (response.ok) {
-        return await response.json();
+        return response;
       }
 
       if (response.status === 404) {
@@ -171,6 +244,31 @@ async function fetchJsonWithPathFallback(
       `Endpoint did not respond with a supported route. Tried: ${paths.join(", ")}`,
     )
   );
+}
+
+function openAiAuthHeaders(apiKey: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (apiKey.trim()) {
+    headers.Authorization = `Bearer ${apiKey.trim()}`;
+  }
+  return headers;
+}
+
+export function buildOpenAiChatCompletionBody(
+  model: string,
+  messages: ChatMessage[],
+  requestOptions?: ChatCompletionRequestOptions,
+): OpenAiChatCompletionBody {
+  const body: OpenAiChatCompletionBody = {
+    model,
+    messages,
+  };
+
+  if (requestOptions?.responseFormat === "json_object") {
+    body.response_format = { type: "json_object" };
+  }
+
+  return body;
 }
 
 export async function listModels(
@@ -233,7 +331,7 @@ export async function listModels(
   return names.sort();
 }
 
-function parseOpenAiContent(data: unknown): string {
+export function parseOpenAiContent(data: unknown): string {
   const choice = (data as { choices?: Array<{ message?: { content?: unknown } }> })
     .choices?.[0];
   const content = choice?.message?.content;
@@ -317,23 +415,15 @@ export async function runChatCompletion(
   }
 
   if (config.kind === "openai") {
-    const headers: Record<string, string> = { ...jsonHeaders };
-    if (config.apiKey.trim()) {
-      headers.Authorization = `Bearer ${config.apiKey.trim()}`;
-    }
-
-    const openAiBody: {
-      model: string;
-      messages: ChatMessage[];
-      response_format?: { type: "json_object" };
-    } = {
-      model: config.model,
-      messages,
+    const headers: Record<string, string> = {
+      ...jsonHeaders,
+      ...openAiAuthHeaders(config.apiKey),
     };
-
-    if (requestOptions?.responseFormat === "json_object") {
-      openAiBody.response_format = { type: "json_object" };
-    }
+    const openAiBody = buildOpenAiChatCompletionBody(
+      config.model,
+      messages,
+      requestOptions,
+    );
 
     const data = await fetchJsonWithPathFallback(
       config.baseUrl,
@@ -403,4 +493,124 @@ export async function runChatCompletion(
   }
 
   return parseOllamaContent(data);
+}
+
+export async function uploadOpenAiBatchInputFile(
+  config: OpenAiTransportConfig,
+  file: Blob,
+  fileName: string,
+  signal?: AbortSignal,
+): Promise<OpenAiFileObject> {
+  const formData = new FormData();
+  formData.append("purpose", "batch");
+  formData.append("file", file, fileName);
+
+  const data = await fetchJsonWithPathFallback(
+    config.baseUrl,
+    openAiPathCandidates("/files"),
+    {
+      method: "POST",
+      headers: openAiAuthHeaders(config.apiKey),
+      signal,
+      body: formData,
+    },
+  );
+
+  return data as OpenAiFileObject;
+}
+
+export async function createOpenAiBatch(
+  config: OpenAiTransportConfig,
+  inputFileId: string,
+  signal?: AbortSignal,
+  metadata?: Record<string, string>,
+): Promise<OpenAiBatchObject> {
+  const body: {
+    input_file_id: string;
+    endpoint: "/v1/chat/completions";
+    completion_window: "24h";
+    metadata?: Record<string, string>;
+  } = {
+    input_file_id: inputFileId,
+    endpoint: "/v1/chat/completions",
+    completion_window: "24h",
+  };
+
+  if (metadata && Object.keys(metadata).length > 0) {
+    body.metadata = metadata;
+  }
+
+  const data = await fetchJsonWithPathFallback(
+    config.baseUrl,
+    openAiPathCandidates("/batches"),
+    {
+      method: "POST",
+      headers: {
+        ...jsonHeaders,
+        ...openAiAuthHeaders(config.apiKey),
+      },
+      signal,
+      body: JSON.stringify(body),
+    },
+  );
+
+  return data as OpenAiBatchObject;
+}
+
+export async function retrieveOpenAiBatch(
+  config: OpenAiTransportConfig,
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<OpenAiBatchObject> {
+  const data = await fetchJsonWithPathFallback(
+    config.baseUrl,
+    openAiPathCandidates(`/batches/${batchId}`),
+    {
+      method: "GET",
+      headers: {
+        ...jsonHeaders,
+        ...openAiAuthHeaders(config.apiKey),
+      },
+      signal,
+    },
+  );
+
+  return data as OpenAiBatchObject;
+}
+
+export async function cancelOpenAiBatch(
+  config: OpenAiTransportConfig,
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<OpenAiBatchObject> {
+  const data = await fetchJsonWithPathFallback(
+    config.baseUrl,
+    openAiPathCandidates(`/batches/${batchId}/cancel`),
+    {
+      method: "POST",
+      headers: {
+        ...jsonHeaders,
+        ...openAiAuthHeaders(config.apiKey),
+      },
+      signal,
+    },
+  );
+
+  return data as OpenAiBatchObject;
+}
+
+export async function downloadOpenAiFileContent(
+  config: OpenAiTransportConfig,
+  fileId: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  return await fetchTextWithPathFallback(
+    config.baseUrl,
+    openAiPathCandidates(`/files/${fileId}/content`),
+    {
+      method: "GET",
+      headers: openAiAuthHeaders(config.apiKey),
+      signal,
+    },
+  );
 }
