@@ -68,16 +68,22 @@ npm run preview
 ### 1) OpenAI-compatible
 
 1. Set `Backend type` to `OpenAI-compatible`
-2. Enter `Base URL` (for example: `https://your-provider.example/v1`)
+2. Base URL auto-defaults to `https://api.openai.com/v1/` (switching back to OpenAI resets to this default)
 3. Enter API key
 4. Click `Load Models`
 5. Select a model from dropdown, or fill `Manual model ID`
 6. For scanned/image-only PDFs, choose a vision-capable model.
 
+When using the official OpenAI endpoint (`https://api.openai.com/v1`) in local development:
+
+- Run the app with `npm run dev`.
+- The app automatically routes OpenAI calls through a local Vite proxy (`/__proxy_openai`) to avoid browser fetch/CORS transport failures.
+- If you serve a static production build, use your own backend relay/proxy for OpenAI requests.
+
 ### 2) Ollama-compatible
 
 1. Set `Backend type` to `Ollama-compatible`
-2. Enter `Base URL` (for local default: `http://localhost:11434`)
+2. Base URL auto-defaults to `http://192.168.4.35:11434` (switching back to Ollama resets to this default)
 3. Click `Load Models`
 4. Select a model from dropdown, or fill `Manual model ID`
 5. For scanned/image-only PDFs, choose a vision-capable model.
@@ -155,6 +161,7 @@ Markdown template requires two section headers:
 - The app does not upload raw PDF files directly as files.
 - For text-based PDFs, only extracted paragraph text chunks are sent to your configured LLM endpoint.
 - For image-only PDFs, rendered page images are sent to your configured vision-capable model.
+- Page images for OCR are rendered at higher resolution to improve extraction quality on scanned PDFs.
 - The app does not run a server that stores PDFs or extracted data.
 - API keys are not logged.
 - Settings persistence is opt-in, and API key is intentionally excluded from stored settings.

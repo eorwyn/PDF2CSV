@@ -90,6 +90,36 @@ function sanitizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, "");
 }
 
+function toDevProxyBaseUrlIfNeeded(baseUrl: string): string {
+  const sanitized = sanitizeBaseUrl(baseUrl);
+  if (typeof window === "undefined") {
+    return sanitized;
+  }
+
+  const host = window.location.hostname;
+  const isLocalDevHost = host === "localhost" || host === "127.0.0.1";
+  if (!isLocalDevHost) {
+    return sanitized;
+  }
+
+  try {
+    const parsed = new URL(sanitized);
+    if (parsed.protocol === "https:" && parsed.hostname === "api.openai.com") {
+      const path = parsed.pathname.replace(/\/+$/, "");
+      if (path === "/v1") {
+        return "/__proxy_openai/v1";
+      }
+      if (path === "" || path === "/") {
+        return "/__proxy_openai";
+      }
+    }
+  } catch {
+    // Ignore invalid URL and use user-provided value as-is.
+  }
+
+  return sanitized;
+}
+
 function openAiPathCandidates(pathWithoutVersion: string): string[] {
   return [pathWithoutVersion, `/v1${pathWithoutVersion}`];
 }
@@ -99,10 +129,11 @@ async function fetchJsonWithPathFallback(
   paths: string[],
   init: RequestInit,
 ): Promise<unknown> {
+  const resolvedBaseUrl = toDevProxyBaseUrlIfNeeded(baseUrl);
   let lastError: Error | null = null;
 
   for (const path of paths) {
-    const url = `${sanitizeBaseUrl(baseUrl)}${path}`;
+    const url = `${sanitizeBaseUrl(resolvedBaseUrl)}${path}`;
     try {
       const response = await fetch(url, init);
 
@@ -121,6 +152,12 @@ async function fetchJsonWithPathFallback(
       );
     } catch (error) {
       if (error instanceof HttpError && error.status === 404) {
+        continue;
+      }
+      if (error instanceof TypeError) {
+        lastError = new Error(
+          `Network/CORS failure while calling ${url}. If you are using OpenAI from the browser, run via local dev server proxy (npm run dev) or use a backend relay.`,
+        );
         continue;
       }
       lastError =
@@ -285,6 +322,19 @@ export async function runChatCompletion(
       headers.Authorization = `Bearer ${config.apiKey.trim()}`;
     }
 
+    const openAiBody: {
+      model: string;
+      messages: ChatMessage[];
+      response_format?: { type: "json_object" };
+    } = {
+      model: config.model,
+      messages,
+    };
+
+    if (requestOptions?.responseFormat === "json_object") {
+      openAiBody.response_format = { type: "json_object" };
+    }
+
     const data = await fetchJsonWithPathFallback(
       config.baseUrl,
       openAiPathCandidates("/chat/completions"),
@@ -292,11 +342,7 @@ export async function runChatCompletion(
         method: "POST",
         headers,
         signal,
-        body: JSON.stringify({
-          model: config.model,
-          temperature: 0,
-          messages,
-        }),
+        body: JSON.stringify(openAiBody),
       },
     );
     return parseOpenAiContent(data);

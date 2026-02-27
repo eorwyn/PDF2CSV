@@ -23,6 +23,8 @@ Keep only main subject-matter content with full sentence paragraphs suitable for
 Exclude short fragments and standalone headings/titles unless they are part of a full sentence paragraph.
 Remove extraneous content including headers, footers, page numbers, navigation, ads/promotions, cookie/privacy/subscription banners, repeated disclaimers not central to content, contact/social blocks, repeated template text, and non-core table-of-contents entries.
 Preserve reading order and coherent paragraph boundaries.
+If you can extract any valid paragraph content, return it directly and do not ask for a higher-resolution input.
+Only emit a low-resolution warning when no reliable paragraph can be extracted from the page.
 If uncertain about boilerplate, exclude it or keep it with possible_boilerplate=true and note.
 Respond with strict JSON only:
 {"paragraphs":[{"text":"string","section_heading":"optional","note":"optional","possible_boilerplate":false,"confidence":0.0}],"warnings":["optional warning"]}

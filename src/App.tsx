@@ -38,6 +38,12 @@ interface SavedSettings {
 }
 
 const SETTINGS_KEY = "pdf2csv.settings.v1";
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1/";
+const DEFAULT_OLLAMA_BASE_URL = "http://192.168.4.35:11434";
+
+function defaultBaseUrlForBackend(kind: BackendKind): string {
+  return kind === "openai" ? DEFAULT_OPENAI_BASE_URL : DEFAULT_OLLAMA_BASE_URL;
+}
 
 function createLog(level: LogLevel, message: string): LogEntry {
   const id =
@@ -95,7 +101,9 @@ export default function App(): JSX.Element {
   const abortRef = useRef<AbortController | null>(null);
 
   const [backendKind, setBackendKind] = useState<BackendKind>("openai");
-  const [baseUrl, setBaseUrl] = useState("");
+  const [baseUrl, setBaseUrl] = useState(
+    defaultBaseUrlForBackend("openai"),
+  );
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -271,6 +279,20 @@ export default function App(): JSX.Element {
     const controller = new AbortController();
     abortRef.current = controller;
 
+    if (
+      backendKind === "openai" &&
+      /^https:\/\/api\.openai\.com(?:\/v1)?\/?$/i.test(baseUrl.trim())
+    ) {
+      const host = window.location.hostname;
+      const isLocalDevHost = host === "localhost" || host === "127.0.0.1";
+      if (!isLocalDevHost) {
+        appendLog(
+          "warning",
+          "Official OpenAI endpoint from a browser may require a relay/proxy. In local development, run via `npm run dev` to use built-in proxy routing.",
+        );
+      }
+    }
+
     try {
       const extractionRows = await runExtraction(files, {
         config: {
@@ -357,7 +379,9 @@ export default function App(): JSX.Element {
             <select
               value={backendKind}
               onChange={(event) => {
-                setBackendKind(event.target.value as BackendKind);
+                const nextKind = event.target.value as BackendKind;
+                setBackendKind(nextKind);
+                setBaseUrl(defaultBaseUrlForBackend(nextKind));
                 setModelError("");
                 setModels([]);
                 setSelectedModel("");

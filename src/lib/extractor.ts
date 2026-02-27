@@ -33,6 +33,9 @@ interface VisionPageDecision {
   warnings: string[];
 }
 
+const OCR_LIMIT_WARNING_PATTERN =
+  /(low[- ]resolution|higher[- ]resolution|too small|unable to reliably|cannot reliably|can't reliably|not reliable|insufficient detail)/i;
+
 export interface RunExtractionOptions extends ExtractionCallbacks {
   config: BackendConfig;
   prompts?: PromptConfig;
@@ -428,12 +431,21 @@ async function processPdfWithVisionFallback(
           { retries: options.retries, signal: options.signal },
         );
 
-        decision.warnings.forEach((warning) =>
+        decision.warnings.forEach((warning) => {
+          const hasParagraphs = decision.paragraphs.length > 0;
+          const looksLikeOcrLimit = OCR_LIMIT_WARNING_PATTERN.test(warning);
+          if (hasParagraphs && looksLikeOcrLimit) {
+            options.onLog?.(
+              "info",
+              `${file.name} page ${pageNumber}: model reported partial OCR limits but still returned extractable paragraphs.`,
+            );
+            return;
+          }
           options.onLog?.(
             "warning",
             `${file.name} page ${pageNumber}: ${warning}`,
-          ),
-        );
+          );
+        });
 
         if (decision.paragraphs.length === 0) {
           options.onLog?.(

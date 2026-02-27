@@ -242,11 +242,12 @@ async function renderPageAsJpegDataUrl(
       intent?: "display";
     }) => { promise: Promise<void> };
   },
-  maxDimension = 1600,
+  maxDimension = 2300,
 ): Promise<string> {
   const baseViewport = page.getViewport({ scale: 1 });
   const largestSide = Math.max(baseViewport.width, baseViewport.height);
-  const scale = largestSide > 0 ? Math.min(2, maxDimension / largestSide) : 1;
+  const scale =
+    largestSide > 0 ? Math.min(3, maxDimension / largestSide) : 1;
   const viewport = page.getViewport({ scale: Math.max(scale, 0.6) });
 
   const canvas = document.createElement("canvas");
@@ -258,7 +259,7 @@ async function renderPageAsJpegDataUrl(
   }
 
   await page.render({ canvasContext: context, viewport, intent: "display" }).promise;
-  return canvas.toDataURL("image/jpeg", 0.86);
+  return canvas.toDataURL("image/jpeg", 0.92);
 }
 
 export async function extractPdfCandidates(
